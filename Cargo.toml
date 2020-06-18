@@ -7,12 +7,14 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
-crate-type = ["dylib"]
+crate-type = ["cdylib"]
 
 [dependencies]
-rustls = { version = "0.17" }
+rustls = "0.17"
+webpki = "0.21"
+thiserror = "1.0"
+rustls-native-certs = "0.3.0"
 
-
-[dependencies.cpython]
-version = "0.5"
+[dependencies.pyo3]
+version = "0.10.1"
 features = ["extension-module"]
