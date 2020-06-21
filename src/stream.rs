@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::mem::ManuallyDrop;
 use std::net::TcpStream;
 
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
 
 pub struct BorrowedTcpStream(ManuallyDrop<TcpStream>);
 
@@ -24,6 +24,13 @@ impl Write for BorrowedTcpStream {
     }
 }
 
+impl Drop for BorrowedTcpStream {
+    fn drop(&mut self) {
+        // SAFETY: this is the only place we remove the stream and its during drop
+        unsafe { ManuallyDrop::take(&mut self.0) }.into_raw_fd();
+    }
+}
+
 impl FromPyObject<'_> for BorrowedTcpStream {
     fn extract(socket: &PyAny) -> PyResult<Self> {
         let proto: i32 = socket.getattr("proto")?.extract()?;
@@ -32,7 +39,7 @@ impl FromPyObject<'_> for BorrowedTcpStream {
         }
         let fd: i32 = socket.call_method0("fileno")?.extract()?;
 
-        // Safety: If we're being passed a valid socket, `fd` will be a valid socket.
+        // SAFETY: If we're being passed a valid socket, `fd` will be a valid socket.
         // TODO(EKF): Assert it's not actually a TcpListener
         let sock = unsafe { TcpStream::from_raw_fd(fd as RawFd) };
         Ok(Self(ManuallyDrop::new(sock)))

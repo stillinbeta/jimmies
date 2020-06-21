@@ -90,9 +90,9 @@ impl SSLSocket {
     }
 
     fn recv(&mut self, py: Python, bufsize: usize) -> PyResult<PyObject> {
-        let mut buf = Vec::with_capacity(bufsize);
-        self.stream.read().read_exact(&mut buf)?;
-        Ok(PyBytes::new(py, &buf).to_object(py))
+        let mut buf = vec![0; bufsize];
+        let size = self.stream.read().read(&mut buf)?;
+        Ok(PyBytes::new(py, &buf[0..size]).to_object(py))
     }
 
     fn recv_into(&mut self, py: Python, buf: &PyAny) -> PyResult<usize> {
@@ -108,7 +108,7 @@ impl SSLSocket {
         // SAFETY: Python guarantees this slice exists with the given size.
         // Will not be mutated as long as we don't call Python before we release the GIL
         let mut slice: &mut [u8] =
-            unsafe { std::slice::from_raw_parts_mut(buf.buf_ptr() as *mut u8, buf.item_size()) };
+            unsafe { std::slice::from_raw_parts_mut(buf.buf_ptr() as *mut u8, buf.len_bytes()) };
 
         self.stream.read().read(&mut slice).map_err(|e| e.into())
     }
