@@ -1,5 +1,7 @@
-use crate::socket::{ClientStream, SSLSocket, Stream};
+use crate::socket::SSLSocket;
+use crate::stream::{BorrowedTcpListener, BorrowedTcpStream};
 use pyo3::{
+    conversion::AsPyPointer,
     exceptions::{NotImplementedError, TypeError, ValueError},
     prelude::*,
 };
@@ -66,9 +68,7 @@ impl Context {
         Ok(cfg)
     }
 
-    // TODO(EKF): handle make_server_config as well
-
-    fn get_client_config(&mut self) -> PyResult<&Arc<rustls::ClientConfig>> {
+    pub fn get_client_config(&mut self) -> PyResult<&Arc<rustls::ClientConfig>> {
         if self.client_cfg.is_none() {
             let cfg = self.make_client_config()?;
             self.client_cfg = Some(Arc::new(cfg))
@@ -76,9 +76,15 @@ impl Context {
         Ok(self.client_cfg.as_ref().unwrap())
     }
 
-    fn get_server_config(&mut self) -> &Arc<rustls::ServerConfig> {
+    pub fn get_server_config(&mut self) -> &Arc<rustls::ServerConfig> {
         self.server_cfg
             .get_or_insert_with(|| Arc::new(rustls::ServerConfig::new(rustls::NoClientAuth::new())))
+    }
+
+    fn get_py_ref(slf: PyRefMut<Self>) -> Py<Context> {
+        // SAFETY: we always know slf is a valid pointer
+        // TODO(EKF): there seems like there should be a safe way to do this
+        unsafe { Py::from_borrowed_ptr(slf.as_ptr()) }
     }
 }
 
@@ -118,25 +124,33 @@ impl Context {
         do_handshake_on_connect = "true"
     )]
     pub fn wrap_socket(
-        &mut self,
+        mut slf: PyRefMut<Self>,
         socket: &PyAny,
         server_side: bool,
         server_hostname: Option<&str>,
         do_handshake_on_connect: bool,
     ) -> PyResult<SSLSocket> {
-        let stream: Box<dyn Stream> = if server_side {
-            let _cfg = self.get_server_config();
-            unimplemented!()
+        let mut sock = if server_side {
+            let sess = rustls::ServerSession::new(slf.get_server_config());
+            let sock: BorrowedTcpListener = socket.extract()?;
+            let fd = sock.fd();
+            SSLSocket::new_server(Self::get_py_ref(slf), fd, sess, sock)
         } else {
             let server_hostname = server_hostname.ok_or_else(|| {
                 TypeError::py_err("server_hostname required for client".to_owned())
             })?;
             let dnsref = get_nameref(server_hostname)?;
-            let cfg = rustls::ClientSession::new(self.get_client_config()?, dnsref);
-            Box::new(ClientStream::new(cfg, socket.extract()?))
+            let sess = rustls::ClientSession::new(slf.get_client_config()?, dnsref);
+            let sock: BorrowedTcpStream = socket.extract()?;
+            let fd = sock.fd();
+            SSLSocket::new_client(
+                Self::get_py_ref(slf),
+                fd,
+                server_hostname.to_owned(),
+                sess,
+                sock,
+            )
         };
-
-        let mut sock = SSLSocket { stream };
 
         if do_handshake_on_connect {
             sock.do_handshake()?

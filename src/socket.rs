@@ -1,71 +1,134 @@
-use crate::{errors::TLSError, stream::BorrowedTcpStream};
-use pyo3::types::PyBytes;
-use pyo3::{buffer::PyBuffer, exceptions::TypeError, prelude::*};
+use crate::{
+    context::Context,
+    errors::TLSError,
+    stream::{BorrowedTcpListener, BorrowedTcpStream},
+};
+use pyo3::{
+    buffer::PyBuffer,
+    exceptions::{NotImplementedError, RuntimeError, TypeError},
+    prelude::*,
+    types::PyBytes,
+};
 use rustls::StreamOwned;
-use std::mem::ManuallyDrop;
-use std::net::TcpStream;
+use std::os::raw::c_int;
 
 pub const TCP_PROTO: i32 = 6;
 
+enum StreamKind {
+    ClientStream(StreamOwned<rustls::ClientSession, BorrowedTcpStream>),
+    ServerStream(StreamOwned<rustls::ServerSession, BorrowedTcpStream>),
+    ServerListener(rustls::ServerSession, BorrowedTcpListener),
+}
+
 #[pyclass()]
 pub struct SSLSocket {
-    pub stream: Box<dyn Stream>,
+    // We can't easily extract this, so just save it for later
+    context: Py<Context>,
+    fileno: c_int,
+    stream: StreamKind,
+    server_name: Option<String>,
 }
 
-pub struct ClientStream {
-    stream: StreamOwned<rustls::ClientSession, BorrowedTcpStream>,
-}
-
-impl ClientStream {
-    pub fn new(sess: rustls::ClientSession, socket: BorrowedTcpStream) -> Self {
+impl SSLSocket {
+    pub fn new_client(
+        context: Py<Context>,
+        fileno: c_int,
+        server_name: String,
+        session: rustls::ClientSession,
+        stream: BorrowedTcpStream,
+    ) -> Self {
         Self {
-            stream: StreamOwned::new(sess, socket),
+            context,
+            fileno,
+            server_name: Some(server_name),
+            stream: StreamKind::ClientStream(StreamOwned::new(session, stream)),
         }
     }
-}
 
-pub trait Stream {
-    fn rs(&mut self) -> (&mut dyn std::io::Read, &mut dyn rustls::Session);
-    fn ws(&mut self) -> (&mut dyn std::io::Write, &mut dyn rustls::Session);
-
-    fn session(&mut self) -> &mut dyn rustls::Session {
-        self.rs().1
-    }
-    fn read(&mut self) -> &mut dyn std::io::Read {
-        self.rs().0
-    }
-    fn write(&mut self) -> &mut dyn std::io::Write {
-        self.ws().0
-    }
-}
-
-impl Stream for ClientStream {
-    fn rs(&mut self) -> (&mut dyn std::io::Read, &mut dyn rustls::Session) {
-        (&mut self.stream.sock, &mut self.stream.sess)
-    }
-    fn ws(&mut self) -> (&mut dyn std::io::Write, &mut dyn rustls::Session) {
-        (&mut self.stream.sock, &mut self.stream.sess)
+    pub fn new_server(
+        context: Py<Context>,
+        fileno: c_int,
+        session: rustls::ServerSession,
+        listener: BorrowedTcpListener,
+    ) -> Self {
+        Self {
+            context,
+            fileno,
+            server_name: None,
+            stream: StreamKind::ServerListener(session, listener),
+        }
     }
 
-    fn read(&mut self) -> &mut dyn std::io::Read {
-        &mut self.stream
+    fn new_server_stream(
+        context: Py<Context>,
+        fileno: c_int,
+        session: rustls::ServerSession,
+        listener: BorrowedTcpStream,
+    ) -> Self {
+        Self {
+            context,
+            fileno,
+            server_name: None,
+            stream: StreamKind::ServerStream(StreamOwned::new(session, listener)),
+        }
     }
 
-    fn write(&mut self) -> &mut dyn std::io::Write {
-        &mut self.stream
+    fn rs(&mut self) -> PyResult<(&mut dyn std::io::Read, &mut dyn rustls::Session)> {
+        use StreamKind::*;
+        match &mut self.stream {
+            ClientStream(so) => Ok((&mut so.sock, &mut so.sess)),
+            ServerStream(so) => Ok((&mut so.sock, &mut so.sess)),
+            ServerListener(_, _) => Err(RuntimeError::py_err("Can't read on listening socket")),
+        }
+    }
+
+    fn ws(&mut self) -> PyResult<(&mut dyn std::io::Write, &mut dyn rustls::Session)> {
+        use StreamKind::*;
+        match &mut self.stream {
+            ClientStream(so) => Ok((&mut so.sock, &mut so.sess)),
+            ServerStream(so) => Ok((&mut so.sock, &mut so.sess)),
+            ServerListener(_, _) => Err(RuntimeError::py_err("Can't write on listening socket")),
+        }
+    }
+
+    fn session(&self) -> &dyn rustls::Session {
+        use StreamKind::*;
+        match &self.stream {
+            ClientStream(so) => &so.sess,
+            ServerStream(so) => &so.sess,
+            ServerListener(sess, _) => sess,
+        }
+    }
+
+    fn reader(&mut self) -> PyResult<&mut dyn std::io::Read> {
+        use StreamKind::*;
+        match &mut self.stream {
+            ClientStream(so) => Ok(so),
+            ServerStream(so) => Ok(so),
+            ServerListener(_, _) => Err(RuntimeError::py_err("Can't read on listening socket")),
+        }
+    }
+
+    fn writer(&mut self) -> PyResult<&mut dyn std::io::Write> {
+        use StreamKind::*;
+        match &mut self.stream {
+            ClientStream(so) => Ok(so),
+            ServerStream(so) => Ok(so),
+            ServerListener(_, _) => Err(RuntimeError::py_err("Can't write on listening socket")),
+        }
     }
 }
 
 #[pymethods]
 impl SSLSocket {
     pub fn do_handshake(&mut self) -> PyResult<()> {
-        while self.stream.session().is_handshaking() {
-            let (w, s) = self.stream.ws();
+        while self.session().is_handshaking() {
+            let (w, s) = self.ws()?;
             if s.wants_write() {
                 s.write_tls(w)?;
                 continue;
             }
-            let (r, s) = self.stream.rs();
+            let (r, s) = self.rs()?;
             if s.wants_read() {
                 s.read_tls(r)?;
                 s.process_new_packets().map_err(TLSError::new)?;
@@ -74,24 +137,25 @@ impl SSLSocket {
         Ok(())
     }
 
-    fn version(&mut self) -> Option<String> {
+    fn version(&self) -> Option<String> {
         use rustls::ProtocolVersion::*;
 
-        self.stream
-            .session()
+        self.session()
             .get_protocol_version()
             .map(|proto| match proto {
                 // Match these to the format Python Expects
                 TLSv1_0 => "TLSv1".to_owned(),
                 TLSv1_1 => "TLSv1.1".to_owned(),
                 TLSv1_2 => "TLSv1.2".to_owned(),
+                TLSv1_3 => "TLSv1.3".to_owned(),
+                // The default formats for everything else is fine
                 _ => format!("{:?}", proto),
             })
     }
 
     fn recv(&mut self, py: Python, bufsize: usize) -> PyResult<PyObject> {
         let mut buf = vec![0; bufsize];
-        let size = self.stream.read().read(&mut buf)?;
+        let size = self.reader()?.read(&mut buf)?;
         Ok(PyBytes::new(py, &buf[0..size]).to_object(py))
     }
 
@@ -110,15 +174,19 @@ impl SSLSocket {
         let mut slice: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(buf.buf_ptr() as *mut u8, buf.len_bytes()) };
 
-        self.stream.read().read(&mut slice).map_err(|e| e.into())
+        self.reader()?.read(&mut slice).map_err(|e| e.into())
     }
 
     fn sendall(&mut self, bytes: &[u8]) -> PyResult<()> {
-        self.stream.write().write_all(&bytes).map_err(|e| e.into())
+        self.writer()?.write_all(&bytes).map_err(|e| e.into())
     }
 
     fn send(&mut self, bytes: &[u8]) -> PyResult<usize> {
-        self.stream.write().write(&bytes).map_err(|e| e.into())
+        self.writer()?.write(&bytes).map_err(|e| e.into())
+    }
+
+    fn fileno(&self) -> c_int {
+        self.fileno
     }
 
     #[args(len = "1024", buffer = "None")]
@@ -137,7 +205,7 @@ impl SSLSocket {
 
     #[args(binary_form = "false")]
     fn get_peer_cert(&mut self, py: Python, binary_form: bool) -> PyResult<PyObject> {
-        let sess = self.stream.session();
+        let sess = self.session();
         if sess.is_handshaking() {
             return Err(pyo3::exceptions::ValueError::py_err(
                 "Handshake not complete",
@@ -154,5 +222,62 @@ impl SSLSocket {
             }
             _ => Ok(py.None()),
         }
+    }
+
+    fn cipher(&self) -> Option<(String, String, usize)> {
+        match (self.version(), self.session().get_negotiated_ciphersuite()) {
+            (Some(version), Some(cs)) => {
+                Some((format!("{:?}", cs.suite), version, cs.enc_key_len * 8))
+            }
+            _ => None,
+        }
+    }
+
+    fn compression(&self) -> PyResult<()> {
+        Err(NotImplementedError::py_err(
+            "rustls does not expose compression information",
+        ))
+    }
+
+    fn selected_alpn_protocol(&self) -> Option<String> {
+        self.session()
+            .get_alpn_protocol()
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+    }
+
+    fn selected_npn_protocol(&mut self) -> Option<String> {
+        // rustls doesn't support NPN
+        None
+    }
+
+    fn accept(&mut self, py: Python) -> PyResult<Self> {
+        let listener = if let StreamKind::ServerListener(_, listener) = &self.stream {
+            listener
+        } else {
+            return Err(RuntimeError::py_err("Can't accept on non-listening socket"));
+        };
+
+        let (stream, _) = listener.accept()?;
+        let mut ctx = self.context.as_ref(py).try_borrow_mut()?;
+        let context_py = self.context.clone_ref(py);
+
+        let cfg = ctx.get_server_config();
+        let sess = rustls::ServerSession::new(cfg);
+        Ok(Self::new_server_stream(
+            context_py,
+            self.fileno,
+            sess,
+            stream,
+        ))
+    }
+
+    #[getter]
+    fn server_hostname(&self) -> Option<&String> {
+        self.server_name.as_ref()
+    }
+
+    #[getter]
+    fn context(&self) -> &Py<Context> {
+        &self.context
     }
 }
