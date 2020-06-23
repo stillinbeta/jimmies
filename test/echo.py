@@ -40,5 +40,5 @@ class EchoServer:
 
     def __exit__(self, type_, value, traceback):
         self.process.terminate()
-        self.client.close()
         self.socket.close()
+        self.client.close()

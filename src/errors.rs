@@ -1,4 +1,4 @@
-use pyo3::{create_exception, create_exception_type_object, PyErr};
+use pyo3::{create_exception, PyErr};
 
 pub struct TLSError(rustls::TLSError);
 
