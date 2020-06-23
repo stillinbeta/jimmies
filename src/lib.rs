@@ -6,9 +6,12 @@ mod stream;
 use crate::context::Context;
 
 use pyo3::{prelude::*, wrap_pyfunction};
+// Just for docs
+pub use errors::TLSError;
+pub use socket::SSLSocket;
 
 #[pyfunction(cafile = "None", capath = "None", cadata = "None")]
-pub fn create_default_context(
+fn create_default_context(
     py: Python,
     cafile: Option<String>,
     capath: Option<String>,
@@ -18,12 +21,13 @@ pub fn create_default_context(
 }
 
 #[pymodule]
-fn jimmies(_py: Python, m: &PyModule) -> PyResult<()> {
+fn jimmies(py: Python, m: &PyModule) -> PyResult<()> {
     // TODO(EKF)
-    stderrlog::new().verbosity(6).init().unwrap();
+    // stderrlog::new().verbosity(6).init().unwrap();
 
     m.add_wrapped(wrap_pyfunction!(create_default_context))?;
     m.add_class::<context::Context>()?;
     m.add_class::<socket::SSLSocket>()?;
+    m.add("TLSException", py.get_type::<errors::TLSException>())?;
     Ok(())
 }
